@@ -1,0 +1,252 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Can K3 be converted on free GitHub-hosted runners, one MoE layer per job?
+#
+# This is a probe, not the conversion. It answers the three things the full
+# 92-job matrix depends on and that nobody has measured:
+#
+#   1. Disk. A standard runner guarantees 14 GB of SSD. One K3 layer is one
+#      17 GB source shard (the index maps every MoE layer to exactly one
+#      shard) plus a ~10.6 GB bank, so a job needs ~28 GB free. Job
+#      `runner` reports what an arm64 runner actually has, before and after
+#      removing the preinstalled toolchains.
+#   2. Time. docs/K3.md measured 0.205 s/expert on a Mac with the NEON
+#      encoder. A 4-core arm64 runner (NEON too — src/vq.c compiles it on
+#      __aarch64__) has never been timed. A job has 6 hours.
+#   3. Upload. Each bank has to leave the runner. Job `layer` pushes it to a
+#      public Hugging Face repo and times that.
+#
+# arm64 on purpose: the fused VQ encoder has a NEON path and no x86 SIMD
+# path, and the torch fallback is ~15x slower.
+#
+# Not probed here, and why: the trunk. Its tensors are spread over all 96
+# shards, so it cannot be built from one layer's download. --skip-trunk
+# therefore exits non-zero after the bank is written — expected. This job
+# judges the run by the bank it produced, never by convert.py's status.
+#
+# Secrets/vars (upload is skipped, not failed, when either is missing):
+#   secrets.HF_TOKEN   a Hugging Face write token
+#   vars.K3_HF_REPO    target model repo, e.g. <hf-user>/Kimi-K3-WARP (public)
+
+name: K3 Actions probe
+
+on:
+  push:
+    branches: [k3-actions-probe]
+    paths: [.github/workflows/k3-actions-probe.yml]
+  workflow_dispatch:
+    inputs:
+      layer:
+        description: MoE layer to convert (1..92)
+        default: '2'
+      experts:
+        description: limit experts (0 = all 896; lower only to debug the workflow)
+        default: '0'
+      upload:
+        description: push the bank to vars.K3_HF_REPO
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3-actions-probe
+  cancel-in-progress: false
+
+env:
+  K3_REPO: moonshotai/Kimi-K3
+  LAYER: ${{ inputs.layer || '2' }}
+  EXPERTS: ${{ inputs.experts || '0' }}
+  UPLOAD: ${{ github.event_name == 'push' || inputs.upload }}
+
+jobs:
+  runner:
+    name: runner facts (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Before cleanup
+        run: |
+          uname -a; nproc; lscpu | grep -E 'Model name|^CPU\(s\)|Core\(s\) per|Flags' | cut -c1-200
+          free -g; df -h
+      - name: Remove preinstalled toolchains
+        run: |
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                   /opt/hostedtoolcache /usr/share/swift /usr/local/share/powershell \
+                   /usr/local/share/chromium /usr/local/lib/node_modules; do
+            [ -e "$d" ] && sudo rm -rf "$d" && echo "removed $d"
+          done
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - name: After cleanup
+        run: |
+          df -h
+          lsblk -o NAME,SIZE,MOUNTPOINT
+          echo "free on / : $(df -BG --output=avail / | tail -1)"
+          [ -d /mnt ] && echo "free on /mnt: $(df -BG --output=avail /mnt | tail -1)"
+
+  layer:
+    name: convert layer ${{ inputs.layer || '2' }} (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                   /opt/hostedtoolcache /usr/share/swift /usr/local/share/powershell \
+                   /usr/local/share/chromium /usr/local/lib/node_modules; do
+            sudo rm -rf "$d"
+          done
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+          mkdir -p "$HOME/k3src" "$HOME/k3out" "$HOME/report"
+
+      - name: Build the native encoder
+        run: |
+          make libwastevq.so
+          ls -la libwastevq.so
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          sudo apt-get install -y time >/dev/null
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install --quiet 'huggingface_hub[hf_xet]'
+
+      # A missing or unloadable .so falls back to torch silently and makes
+      # every timing below meaningless. Refuse instead.
+      - name: Native encoder is what convert.py will use
+        working-directory: tools
+        run: |
+          python - <<'EOF'
+          import convert
+          vq = convert._load_vq()
+          assert vq is not None, "libwastevq did not load: the timing would be the torch path"
+          print("native encoder:", vq[0])
+          EOF
+
+      - name: Fetch config, index and this layer's shard
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          # the Xet chunk cache would keep a second copy of the 17 GB shard
+          HF_XET_CHUNK_CACHE_SIZE_BYTES: '0'
+        run: |
+          python - <<'EOF'
+          import json, os, re, time
+          from huggingface_hub import hf_hub_download, HfApi
+          repo, L, dst = os.environ["K3_REPO"], int(os.environ["LAYER"]), os.path.expanduser("~/k3src")
+          for f in ("config.json", "model.safetensors.index.json"):
+              hf_hub_download(repo, f, local_dir=dst)
+          wm = json.load(open(f"{dst}/model.safetensors.index.json"))["weight_map"]
+          shards = sorted({f for n, f in wm.items()
+                           if f".layers.{L}." in n and ".experts." in n})
+          assert len(shards) == 1, f"layer {L} expert tensors span {shards}"
+          size = {s.path: s.size for s in HfApi().list_repo_tree(repo) if hasattr(s, "size")}
+          t = time.time()
+          p = hf_hub_download(repo, shards[0], local_dir=dst)
+          dt = time.time() - t
+          got = os.path.getsize(p)
+          assert got == size[shards[0]], f"{shards[0]}: {got} bytes, index says {size[shards[0]]}"
+          print(f"{shards[0]}: {got/1e9:.2f} GB in {dt:.0f} s = {got/dt/1e6:.0f} MB/s")
+          json.dump({"shard": shards[0], "shard_bytes": got, "download_s": round(dt, 1)},
+                    open(os.path.expanduser("~/report/download.json"), "w"))
+          EOF
+          rm -rf "$HOME/k3src/.cache"
+          df -h /
+
+      - name: Convert (exit status is not the verdict — see header)
+        run: |
+          ( while sleep 20; do df -B1 --output=used / | tail -1; done ) > "$HOME/report/disk.log" &
+          sampler=$!
+          start=$(date +%s)
+          set +e
+          /usr/bin/time -v -o "$HOME/report/time.txt" \
+            python tools/convert.py --src "$HOME/k3src" --out "$HOME/k3out" \
+              --layers "$LAYER" --experts "$EXPERTS" --device cpu --jobs 1 --skip-trunk \
+            2>&1 | tee "$HOME/report/convert.log"
+          echo "convert.py status ${PIPESTATUS[0]} (diagnostic only)"
+          echo "$(( $(date +%s) - start ))" > "$HOME/report/convert_s"
+          kill $sampler
+          ls -la "$HOME/k3out"; df -h /
+
+      - name: Judge the bank
+        working-directory: tools
+        run: |
+          python - <<'EOF'
+          import json, os, sys, convert
+          L, lim = int(os.environ["LAYER"]), int(os.environ["EXPERTS"])
+          out, rep = os.path.expanduser("~/k3out"), os.path.expanduser("~/report")
+          cfg = json.load(open(os.path.expanduser("~/k3src/config.json")))
+          cfg = cfg.get("text_config") or cfg
+          n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
+          if lim: n_exp = min(n_exp, lim)
+          bank = f"{out}/experts-L{L}.bin"
+          assert os.path.exists(bank), f"no bank written: {bank}"
+          assert convert.bank_is_sound(bank, L, n_exp), f"{bank} is not a whole bank of {n_exp}"
+          cb = f"{out}/codebooks.bin"
+          assert os.path.exists(cb) and os.path.getsize(cb) > 0, "no merged codebooks"
+          secs = int(open(f"{rep}/convert_s").read())
+          used = [int(x) for x in open(f"{rep}/disk.log").read().split()] or [0]
+          rss = next((l.split(":")[1].strip() for l in open(f"{rep}/time.txt")
+                      if "Maximum resident" in l), "?")
+          r = json.load(open(f"{rep}/download.json"))
+          r.update(layer=L, experts=n_exp, convert_s=secs,
+                   s_per_expert=round(secs / n_exp, 3),
+                   projected_full_layer_min=round(secs / n_exp * 896 / 60, 1),
+                   bank_bytes=os.path.getsize(bank), codebooks_bytes=os.path.getsize(cb),
+                   peak_disk_used_gb=round(max(used) / 1e9, 1), max_rss_kb=rss,
+                   nproc=os.cpu_count())
+          json.dump(r, open(f"{rep}/result.json", "w"), indent=1)
+          print(json.dumps(r, indent=1))
+          EOF
+
+      - name: Upload bank to Hugging Face
+        if: env.UPLOAD == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.K3_HF_REPO }}
+        run: |
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_REPO" ]; then
+            echo "::warning::HF_TOKEN secret or K3_HF_REPO variable not set - upload skipped"
+            exit 0
+          fi
+          python - <<'EOF'
+          import json, os, time
+          from huggingface_hub import HfApi
+          api, repo, L = HfApi(), os.environ["HF_REPO"], os.environ["LAYER"]
+          out, rep = os.path.expanduser("~/k3out"), os.path.expanduser("~/report")
+          api.create_repo(repo, repo_type="model", private=False, exist_ok=True)
+          # probe/ keeps this out of the layout the real run will publish.
+          # Its codebooks are numbered from 0 because it converted one layer
+          # alone; the full matrix needs the base-by-layer patch first.
+          t = time.time()
+          api.upload_file(path_or_fileobj=f"{out}/experts-L{L}.bin", repo_id=repo,
+                          path_in_repo=f"probe/experts-L{L}.bin",
+                          commit_message=f"probe: layer {L} bank")
+          dt = time.time() - t
+          n = os.path.getsize(f"{out}/experts-L{L}.bin")
+          r = json.load(open(f"{rep}/result.json"))
+          r.update(upload_s=round(dt, 1), upload_mb_s=round(n / dt / 1e6))
+          json.dump(r, open(f"{rep}/result.json", "w"), indent=1)
+          api.upload_file(path_or_fileobj=f"{rep}/result.json", repo_id=repo,
+                          path_in_repo=f"probe/result-L{L}.json",
+                          commit_message=f"probe: layer {L} result")
+          print(f"uploaded {n/1e9:.2f} GB in {dt:.0f} s = {n/dt/1e6:.0f} MB/s")
+          EOF
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo '### K3 probe, layer '"$LAYER"; echo '```json'
+            cat "$HOME/report/result.json" 2>/dev/null || echo '(no result: see the failing step)'
+            echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k3-probe-report-L${{ env.LAYER }}
+          path: ~/report/
