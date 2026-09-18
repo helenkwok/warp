@@ -1347,6 +1347,14 @@ def main():
                          "staging is the container plus the shards still "
                          "owed rather than the container plus the whole "
                          "checkpoint; 'dry' only says what it would delete")
+    ap.add_argument("--codebook-base", choices=("append", "layer"),
+                    default="append",
+                    help="where a new layer's codebooks go: 'append' after "
+                         "the records already published (the default), or "
+                         "'layer' at a slot fixed by the layer's position, "
+                         "so separate --layers runs on separate machines "
+                         "never collide and their banks can be gathered "
+                         "into one container afterwards")
     args = ap.parse_args()
     if args.jobs < 1:
         ap.error("--jobs must be at least 1")
@@ -1560,6 +1568,29 @@ def main():
 
     n_cb_per_layer = 3 * args.stages
     next_base = old_books
+
+    # --codebook-base layer: a layer's base is a function of the layer alone.
+    # Append numbering hands out bases in the order *this invocation* meets
+    # its layers, so 92 one-layer runs on 92 machines would each number
+    # theirs from 0, and the merge that gathers them refuses the overlap —
+    # after every one of them has run.
+    by_layer = args.codebook_base == "layer"
+
+    def slot(L):
+        return (L - first_dense) * n_cb_per_layer
+
+    if by_layer:
+        # Mixing the two schemes in one container is the collision this mode
+        # exists to avoid: an appended layer can sit in another's slot.
+        mixed = sorted(int(k) for k, m in manifest_layers.items()
+                       if m.get("codebook_base") != slot(int(k)))
+        if mixed:
+            print(f"--codebook-base layer: {manifest_path} numbers layer(s) "
+                  f"{mixed[:8]} by append, not by position. Convert this "
+                  f"container without --codebook-base layer, or start a new "
+                  f"one.", file=sys.stderr)
+            return 1
+
     jobs = []
     for L in layers:
         meta = manifest_layers.get(str(L), {})
@@ -1582,9 +1613,12 @@ def main():
             recovered = bank_codebook_base(bank)
             # Bounded by the whole model, not by this invocation's --layers:
             # the base in the bank reflects the run that wrote it, which may
-            # have been converting far more layers than this one is.
-            if (old_books <= recovered <=
-                    old_books + n_layers * n_cb_per_layer and
+            # have been converting far more layers than this one is. By
+            # position there is exactly one right answer, and it may sit
+            # below old_books, in padding an earlier run left for it.
+            if ((recovered == slot(L) if by_layer else
+                 old_books <= recovered <=
+                 old_books + n_layers * n_cb_per_layer) and
                     os.path.exists(part) and
                     os.path.getsize(part) == n_cb_per_layer * cb_record_bytes
                     and os.path.getsize(bank) > 0):
@@ -1594,9 +1628,12 @@ def main():
         source_ok = (st.have(ename(L, 0, _t0)) or
                      st.have(ename(L, 0, _t0) + "_packed"))
         if not cached_ok:
-            base = next_base
-            if source_ok:
-                next_base += n_cb_per_layer
+            if by_layer:
+                base = slot(L)
+            else:
+                base = next_base
+                if source_ok:
+                    next_base += n_cb_per_layer
         elif base + n_cb_per_layer > next_base:
             next_base = base + n_cb_per_layer
         jobs.append((L, args.src, args.out, src_pfx, n_exp, args.stages,
@@ -1680,7 +1717,7 @@ def main():
     parts = [(res[2], os.path.join(args.out, f"codebooks-L{res[0]}.bin"))
              for res in results]
     if any(os.path.exists(p) for _, p in parts):
-        with open(merged + ".tmp", "wb") as cb_out:
+        with open(merged + ".tmp", "w+b") as cb_out:
             if compatible:
                 with open(merged, "rb") as old:
                     shutil.copyfileobj(old, cb_out)
@@ -1688,7 +1725,24 @@ def main():
                 if os.path.exists(part):
                     if os.path.getsize(part) != n_cb_per_layer * cb_record_bytes:
                         raise RuntimeError(f"malformed codebook part: {part}")
+                    cb_out.seek(0, os.SEEK_END)
                     expected = cb_out.tell() // cb_record_bytes
+                    if by_layer and base + n_cb_per_layer <= expected:
+                        # By position, a layer an earlier run skipped has a
+                        # slot inside the published file, held by the padding
+                        # below. Fill it — but only if it is still padding:
+                        # every real record opens with MAGIC_CODEBOOK, so a
+                        # slot holding anything but zeros belongs to a layer.
+                        n = n_cb_per_layer * cb_record_bytes
+                        cb_out.seek(base * cb_record_bytes)
+                        if cb_out.read(n) != b"\0" * n:
+                            raise RuntimeError(
+                                f"codebook slot {base} is already taken")
+                        cb_out.seek(base * cb_record_bytes)
+                        with open(part, "rb") as pf:
+                            cb_out.write(pf.read())
+                        os.remove(part)
+                        continue
                     if base < expected:
                         raise RuntimeError(
                             f"codebook base {base} overlaps the {expected} "

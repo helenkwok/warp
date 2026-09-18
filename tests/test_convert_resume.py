@@ -146,7 +146,7 @@ CONV.convert_layer = fake_convert_layer
 
 
 def run(out, src, layers=None, jobs=1, skip_trunk=False, want_rc=0,
-        reclaim=None):
+        reclaim=None, codebook_base=None):
     del converted[:]
     argv = ["convert.py", "--src", src, "--out", out, "--jobs", str(jobs),
             "--stages", str(STAGES)]
@@ -156,6 +156,8 @@ def run(out, src, layers=None, jobs=1, skip_trunk=False, want_rc=0,
         argv += ["--skip-trunk"]
     if reclaim:
         argv += ["--reclaim", reclaim]
+    if codebook_base:
+        argv += ["--codebook-base", codebook_base]
     old = sys.argv
     sys.argv = argv
     try:
@@ -414,6 +416,61 @@ def main():
         run(os.path.join(tmp, "unver.waste"), rsrc, reclaim="on", want_rc=1)
         ck(shards_on_disk(rsrc) == sorted(SHARDS),
            "a half-downloaded checkpoint refuses and keeps every shard")
+        print("--codebook-base layer: one layer per machine, gathered after")
+        # The shape of a conversion spread over CI runners: each job converts
+        # one layer into a directory of its own, with no manifest to share
+        # and no trunk (--skip-trunk then refuses to publish, as it does on
+        # a real runner). Its codebooks.bin is the only place its part
+        # survives, so the gather step slices it back out at the bank's base.
+        pool = os.path.join(tmp, "gathered.waste")
+        os.makedirs(pool)
+        for L in MOE_LAYERS:
+            job = os.path.join(tmp, f"job-L{L}.waste")
+            run(job, src, layers=[L], skip_trunk=True, want_rc=1,
+                codebook_base="layer")
+            base = CONV.bank_codebook_base(os.path.join(job, f"experts-L{L}.bin"))
+            ck(base == (L - FIRST_DENSE) * PER_LAYER,
+               f"L{L} is numbered by position ({base}), not from 0")
+            raw = open(os.path.join(job, "codebooks.bin"), "rb").read()
+            ok, why = check_consistency(job, [L])
+            ck(ok, f"and its own codebooks.bin agrees ({why})")
+            shutil.copy(os.path.join(job, f"experts-L{L}.bin"), pool)
+            with open(os.path.join(pool, f"codebooks-L{L}.bin"), "wb") as f:
+                f.write(raw[base * REC:(base + PER_LAYER) * REC])
+        did = run(pool, src, codebook_base="layer")
+        ck(did == [], f"the gather converts nothing {did}")
+        ck(books(pool) == list(range(len(MOE_LAYERS) * PER_LAYER)),
+           "codebooks.bin comes out dense and in order")
+        ok, why = check_consistency(pool, MOE_LAYERS)
+        ck(ok, f"each bank indexes its own records ({why})")
+        ck(sorted(int(k) for k in manifest(pool)["layers"]) == MOE_LAYERS,
+           "and the published manifest lists every layer")
+
+        print("--codebook-base layer fills a hole a later run converts")
+        out = os.path.join(tmp, "hole.waste")
+        run(out, src, layers=[1, 3], codebook_base="layer")
+        ck(books(out)[PER_LAYER:2 * PER_LAYER] == [0] * PER_LAYER,
+           "layer 2's slot is published as padding")
+        did = run(out, src, layers=[2], codebook_base="layer")
+        ck(did == [2], f"converts the missing layer {did}")
+        ck(books(out) == list(range(3 * PER_LAYER)),
+           "into its slot, leaving layers 1 and 3 where they were")
+        ok, why = check_consistency(out, [1, 2, 3])
+        ck(ok, f"each bank indexes its own records ({why})")
+
+        print("--codebook-base layer refuses a container numbered by append")
+        out = os.path.join(tmp, "mixed.waste")
+        run(out, src, layers=[3])            # append: layer 3 lands at 0
+        before = books(out)
+        run(out, src, layers=[1], codebook_base="layer", want_rc=1)
+        ck(books(out) == before and manifest(out)["layers"].keys() == {"3"},
+           "and changes nothing")
+
+        print("append numbering is unchanged")
+        out = os.path.join(tmp, "append.waste")
+        run(out, src, layers=[3])
+        ck(CONV.bank_codebook_base(os.path.join(out, "experts-L3.bin")) == 0,
+           "a lone layer 3 still takes base 0 by default")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
