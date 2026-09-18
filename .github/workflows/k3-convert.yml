@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Convert K3's routed experts on free GitHub-hosted runners, one MoE layer
+# per job, and publish each layer to a Hugging Face repo as it lands.
+#
+# Why this shape (numbers from k3-actions-probe.yml and the release index):
+#   - Every K3 MoE layer's experts live in exactly one ~17 GB source shard,
+#     so a job downloads one file and writes one ~10.6 GB bank. An arm64
+#     runner has ~109 GB free, 4 Neoverse-N2 cores and 15 GB of RAM; the
+#     converter streams one expert at a time.
+#   - arm64 because src/vq.c's fused encoder has a NEON path and no x86 one.
+#   - --codebook-base layer numbers each layer's codebooks by its position,
+#     so 92 jobs that never see each other still produce banks that gather
+#     into one container. Without it every job would number from 0.
+#
+# What this does NOT produce: the trunk, and therefore a runnable container.
+# The trunk's tensors are spread over all 96 shards. The gather step — the
+# banks and codebook parts from this repo, the trunk from the source — runs
+# on the machine that will hold the container:
+#
+#   convert.py --src <k3 source, trunk tensors> --out <dir with every
+#              experts-L*.bin and codebooks-L*.bin> --codebook-base layer
+#
+# which recognises every bank as done (tests/test_convert_resume.py,
+# "one layer per machine, gathered after") and builds only the trunk.
+#
+# Resumable: the plan job skips every layer whose three files are already in
+# the target repo, so a re-run after failures converts only the gaps.
+#
+# Started by pushing to the k3-convert branch, not by dispatch: a
+# workflow_dispatch workflow must exist on the default branch, and this one
+# has no business on main.
+#
+#   git push origin HEAD:k3-convert       # start, or resume
+#
+# Needs secrets.HF_TOKEN (write) and vars.K3_HF_REPO (public model repo).
+
+name: K3 convert
+
+on:
+  push:
+    branches: [k3-convert]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3-convert
+  cancel-in-progress: false
+
+env:
+  K3_REPO: moonshotai/Kimi-K3
+  # Pinned so a layer re-run days later trains its codebooks with the same
+  # code as the rest. The probe measured these versions.
+  TORCH_SPEC: torch==2.14.0
+  HUB_SPEC: huggingface_hub[hf_xet]==1.32.0
+  # Empty = every MoE layer. A comma list converts only those (still
+  # skipping any already published) — for a partial re-run by hand.
+  ONLY_LAYERS: ''
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      layers: ${{ steps.plan.outputs.layers }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: Python deps
+        run: python3 -m pip install --quiet --break-system-packages "$HUB_SPEC"
+      - id: plan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.K3_HF_REPO }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          from huggingface_hub import HfApi, hf_hub_download
+          assert os.environ.get("HF_TOKEN"), "secrets.HF_TOKEN is not set"
+          repo = os.environ.get("HF_REPO"); assert repo, "vars.K3_HF_REPO is not set"
+          api = HfApi()
+          api.create_repo(repo, repo_type="model", private=False, exist_ok=True)
+          cfg = json.load(open(hf_hub_download(os.environ["K3_REPO"], "config.json")))
+          cfg = cfg.get("text_config") or cfg
+          moe = list(range(cfg.get("first_k_dense_replace", 0), cfg["num_hidden_layers"]))
+          want = ([int(x) for x in os.environ["ONLY_LAYERS"].split(",")]
+                  if os.environ["ONLY_LAYERS"] else moe)
+          have = set(api.list_repo_files(repo))
+          done = [L for L in want if {f"layers/experts-L{L}.bin",
+                                      f"layers/codebooks-L{L}.bin",
+                                      f"layers/L{L}.json"} <= have]
+          todo = [L for L in want if L not in done]
+          print(f"{len(moe)} MoE layers; {len(done)} already published; converting {todo}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"layers={json.dumps(todo)}\ncount={len(todo)}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"**{len(done)}/{len(moe)} layers already published; "
+                      f"converting {len(todo)}**\n")
+          EOF
+
+  layer:
+    name: L${{ matrix.layer }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        layer: ${{ fromJSON(needs.plan.outputs.layers) }}
+    env:
+      LAYER: ${{ matrix.layer }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the native encoder
+        run: make libwastevq.so
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
+          python -m pip install --quiet "$HUB_SPEC"
+
+      # Without the .so, convert.py falls back to torch silently: ~15x slower,
+      # which on a 6-hour job limit is the difference between a bank and none.
+      - name: Native encoder is what convert.py will use
+        working-directory: tools
+        run: python -c "import convert; assert convert._load_vq(), 'libwastevq did not load'"
+
+      - name: Fetch config, index and this layer's shard
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          HF_XET_CHUNK_CACHE_SIZE_BYTES: '0'
+        run: |
+          python - <<'EOF'
+          import json, os, time
+          from huggingface_hub import hf_hub_download, HfApi
+          repo, L, dst = os.environ["K3_REPO"], int(os.environ["LAYER"]), os.path.expanduser("~/k3src")
+          for f in ("config.json", "model.safetensors.index.json"):
+              hf_hub_download(repo, f, local_dir=dst)
+          wm = json.load(open(f"{dst}/model.safetensors.index.json"))["weight_map"]
+          shards = sorted({f for n, f in wm.items() if f".layers.{L}." in n and ".experts." in n})
+          assert len(shards) == 1, f"layer {L} expert tensors span {shards}"
+          size = {s.path: s.size for s in HfApi().list_repo_tree(repo) if hasattr(s, "size")}
+          t = time.time()
+          p = hf_hub_download(repo, shards[0], local_dir=dst)
+          assert os.path.getsize(p) == size[shards[0]], f"{shards[0]} is short"
+          os.makedirs(os.path.expanduser("~/report"), exist_ok=True)
+          json.dump({"shard": shards[0], "download_s": round(time.time() - t, 1)},
+                    open(os.path.expanduser("~/report/download.json"), "w"))
+          EOF
+          rm -rf "$HOME/k3src/.cache"
+
+      - name: Convert (exit status is not the verdict)
+        run: |
+          start=$(date +%s)
+          set +e
+          python tools/convert.py --src "$HOME/k3src" --out "$HOME/k3out" \
+            --layers "$LAYER" --device cpu --jobs 1 --skip-trunk --codebook-base layer \
+            2>&1 | tee "$HOME/report/convert.log"
+          echo "convert.py status ${PIPESTATUS[0]} (non-zero expected: --skip-trunk with no trunk)"
+          echo "$(( $(date +%s) - start ))" > "$HOME/report/convert_s"
+
+      # The verdict: a whole bank, numbered by position, whose codebook slot
+      # holds real records. Then cut that slot out of codebooks.bin — the
+      # merge deleted the part, and the gather step needs it back as
+      # codebooks-L{L}.bin beside the bank.
+      - name: Judge the bank and cut out its codebooks
+        working-directory: tools
+        run: |
+          python - <<'EOF'
+          import hashlib, json, os, struct, subprocess, torch, convert
+          L = int(os.environ["LAYER"])
+          out, rep = os.path.expanduser("~/k3out"), os.path.expanduser("~/report")
+          cfg = json.load(open(os.path.expanduser("~/k3src/config.json")))
+          cfg = cfg.get("text_config") or cfg
+          n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
+          first = cfg.get("first_k_dense_replace", 0)
+          per = 3 * 3                                    # 3 kinds x --stages 3
+          rec = struct.calcsize("<IHBBII") + convert.CB_ENTRIES * convert.VEC_DIM * 2
+          bank = f"{out}/experts-L{L}.bin"
+          assert convert.bank_is_sound(bank, L, n_exp), f"{bank} is not a whole bank of {n_exp}"
+          base = convert.bank_codebook_base(bank)
+          assert base == (L - first) * per, f"bank base {base}, slot is {(L - first) * per}"
+          raw = open(f"{out}/codebooks.bin", "rb").read()
+          part = raw[base * rec:(base + per) * rec]
+          assert len(part) == per * rec, "codebooks.bin is short of this layer's slot"
+          for i in range(per):
+              magic, cid = struct.unpack_from("<IH", part, i * rec)
+              assert magic == convert.MAGIC_CODEBOOK and cid == (base + i) & 0xFFFF, \
+                  f"record {i} of the slot is not codebook {base + i}"
+          open(f"{out}/codebooks-L{L}.bin", "wb").write(part)
+          h = hashlib.sha256()
+          with open(bank, "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 24), b""):
+                  h.update(chunk)
+          secs = int(open(f"{rep}/convert_s").read())
+          meta = json.load(open(f"{rep}/download.json"))
+          meta.update(layer=L, experts=n_exp, codebook_base=base,
+                      bank_bytes=os.path.getsize(bank), bank_sha256=h.hexdigest(),
+                      codebooks_sha256=hashlib.sha256(part).hexdigest(),
+                      convert_s=secs, s_per_expert=round(secs / n_exp, 3),
+                      warp_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                      torch=torch.__version__, runner=os.uname().machine,
+                      args="--device cpu --jobs 1 --stages 3 --codebook-base layer")
+          json.dump(meta, open(f"{out}/L{L}.json", "w"), indent=1)
+          print(json.dumps(meta, indent=1))
+          EOF
+
+      # One commit per layer carrying all three files, so a layer is either
+      # wholly published or absent — which is what the plan job checks.
+      # Retried: 92 jobs committing to one repo can race or be rate-limited.
+      - name: Publish the layer
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.K3_HF_REPO }}
+        run: |
+          python - <<'EOF'
+          import os, random, time
+          from huggingface_hub import HfApi, CommitOperationAdd
+          api, repo, L = HfApi(), os.environ["HF_REPO"], os.environ["LAYER"]
+          out = os.path.expanduser("~/k3out")
+          ops = [CommitOperationAdd(f"layers/{n}", f"{out}/{n}")
+                 for n in (f"experts-L{L}.bin", f"codebooks-L{L}.bin", f"L{L}.json")]
+          for attempt in range(8):
+              try:
+                  t = time.time()
+                  api.create_commit(repo, ops, commit_message=f"layer {L}")
+                  print(f"published layer {L} in {time.time() - t:.0f} s")
+                  break
+              except Exception as e:
+                  wait = min(600, 30 * 2 ** attempt) + random.uniform(0, 30)
+                  print(f"attempt {attempt + 1} failed ({e!r}); retrying in {wait:.0f} s")
+                  time.sleep(wait)
+          else:
+              raise SystemExit(f"layer {L}: could not publish after 8 attempts")
+          EOF
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### L$LAYER"; echo '```json'
+            cat "$HOME/k3out/L$LAYER.json" 2>/dev/null || tail -20 "$HOME/report/convert.log" 2>/dev/null
+            echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  tally:
+    name: tally
+    needs: [plan, layer]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Python deps
+        run: python3 -m pip install --quiet --break-system-packages "$HUB_SPEC"
+      - name: What is published, what is missing
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.K3_HF_REPO }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          from huggingface_hub import HfApi, hf_hub_download
+          api, repo = HfApi(), os.environ["HF_REPO"]
+          cfg = json.load(open(hf_hub_download(os.environ["K3_REPO"], "config.json")))
+          cfg = cfg.get("text_config") or cfg
+          moe = range(cfg.get("first_k_dense_replace", 0), cfg["num_hidden_layers"])
+          have = set(api.list_repo_files(repo))
+          missing = [L for L in moe if f"layers/L{L}.json" not in have]
+          line = (f"**{len(moe) - len(missing)}/{len(moe)} layers published.** "
+                  + (f"Missing: {missing}. Push to k3-convert again to convert only these."
+                     if missing else "Every layer is published; next is the gather step."))
+          print(line)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(line + "\n")
+          EOF
