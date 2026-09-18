@@ -124,6 +124,11 @@ def fake_convert_layer(job):
     bank = os.path.join(out, f"experts-L{L}.bin")
     if cached_ok and os.path.exists(bank):
         return (L, os.path.getsize(bank), cb_base, "cached")
+    # The real convert_layer finds no MoE layout for a layer whose shard is
+    # absent and reports it missing; a fake that converted anyway would hide
+    # every behaviour that depends on a layer not being there.
+    if not CONV.ST(src).have(expert_names(L)[0]):
+        return (L, 0, cb_base, "missing")
     converted.append(L)
     # A bank whose every record names cb_base, as write_expert_record does —
     # and with the whole 48-byte header, because bank_is_sound reads the
@@ -445,6 +450,38 @@ def main():
         ck(ok, f"each bank indexes its own records ({why})")
         ck(sorted(int(k) for k in manifest(pool)["layers"]) == MOE_LAYERS,
            "and the published manifest lists every layer")
+
+        print("--codebook-base layer: trunk built alone, layers gathered onto it")
+        # tools/trunk_remote.py's shape: one run sees no expert shards, so every
+        # MoE layer is missing and the manifest it publishes is the trunk
+        # alone. The gather then brings the banks and parts and must add all
+        # of them with --skip-trunk, carrying that trunk forward untouched.
+        tsrc = make_src(os.path.join(tmp, "src-trunkonly"))
+        for s in SHARDS:
+            if s != "shard-trunk.safetensors":
+                os.remove(os.path.join(tsrc, s))
+        out = os.path.join(tmp, "trunkfirst.waste")
+        did = run(out, tsrc, codebook_base="layer")
+        m = manifest(out)
+        ck(did == [] and m["trunk"] and not m.get("layers"),
+           "the trunk-only run publishes a trunk and no layers")
+        trunk_before = open(os.path.join(out, "trunk.bin"), "rb").read()
+        for L in MOE_LAYERS:
+            job = os.path.join(tmp, f"job-L{L}.waste")      # from the test above
+            base = (L - FIRST_DENSE) * PER_LAYER
+            raw = open(os.path.join(job, "codebooks.bin"), "rb").read()
+            shutil.copy(os.path.join(job, f"experts-L{L}.bin"), out)
+            with open(os.path.join(out, f"codebooks-L{L}.bin"), "wb") as f:
+                f.write(raw[base * REC:(base + PER_LAYER) * REC])
+        did = run(out, tsrc, skip_trunk=True, codebook_base="layer")
+        m = manifest(out)
+        ck(did == [], f"the gather converts nothing {did}")
+        ck(sorted(int(k) for k in m["layers"]) == MOE_LAYERS,
+           "and publishes every layer")
+        ck(m["trunk"] and open(os.path.join(out, "trunk.bin"), "rb").read()
+           == trunk_before, "onto the trunk it was given, unchanged")
+        ok, why = check_consistency(out, MOE_LAYERS)
+        ck(ok, f"each bank indexes its own records ({why})")
 
         print("--codebook-base layer fills a hole a later run converts")
         out = os.path.join(tmp, "hole.waste")

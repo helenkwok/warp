@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build K3's trunk on one free runner, without the 1.42 TB download, and
+# publish it beside the expert banks k3-convert.yml wrote.
+#
+# The trunk is 2628 tensors / 114.4 GB of bf16 spread over all 96 shards (the
+# shard headers say so), which is why it could not be split per layer like the
+# experts. tools/trunk_remote.py does not need the shards: it lays each out as
+# a sparse file holding only its header and fetches a tensor with one HTTP
+# Range request when convert.py reads it, punching the hole afterwards. Peak
+# disk is the ~28 GB output plus one tensor. convert.py runs unmodified, and
+# the driver refuses to succeed unless the trunk holds every trunk tensor the
+# index names — build_trunk skips an absent one without a word.
+#
+# Measured before this was written:
+#   - a 14-tensor smoke run (layer 5 attention) came out byte-identical to an
+#     independent fetch + quantize of the same tensors;
+#   - the largest tensor, embed_tokens [163840, 7168], peaks at 10.6 GB RSS
+#     through quantize_q8g. A runner has 15 GB; the swap file is insurance.
+#
+# Output: trunk/ in the HF repo — trunk.bin, a manifest with the trunk and no
+# layers, and the tokenizer/specials/chat/vision sidecars. The gather step,
+# wherever the container is assembled, puts those beside every
+# layers/experts-L*.bin and layers/codebooks-L*.bin and runs
+#
+#   convert.py --src <K3 small files> --out <that dir> --skip-trunk --codebook-base layer
+#
+# (tests/test_convert_resume.py, "trunk built alone, layers gathered onto it").
+#
+#   git push origin HEAD:k3-trunk
+
+name: K3 trunk
+
+on:
+  push:
+    branches: [k3-trunk]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3-trunk
+  cancel-in-progress: false
+
+env:
+  K3_REPO: moonshotai/Kimi-K3
+  TORCH_SPEC: torch==2.14.0
+  HUB_SPEC: huggingface_hub[hf_xet]==1.32.0
+
+jobs:
+  trunk:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swap (insurance for the 10.6 GB embed_tokens peak)
+        run: |
+          sudo fallocate -l 16G /swap2 && sudo chmod 600 /swap2
+          sudo mkswap /swap2 >/dev/null && sudo swapon /swap2
+          free -g; df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
+          python -m pip install --quiet "$HUB_SPEC"
+
+      - name: Build the trunk from Range reads
+        run: |
+          /usr/bin/time -v -o "$HOME/time.txt" \
+            python tools/trunk_remote.py --repo "$K3_REPO" \
+              --src "$HOME/k3src" --out "$HOME/k3trunk" 2>&1 | tee "$HOME/trunk.log"
+          status=${PIPESTATUS[0]}
+          grep -E "Maximum resident|Elapsed" "$HOME/time.txt"
+          du -sh "$HOME/k3src"; ls -la "$HOME/k3trunk"
+          exit $status
+
+      - name: Publish trunk/
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.K3_HF_REPO }}
+        run: |
+          python - <<'EOF'
+          import os, time
+          from huggingface_hub import HfApi, CommitOperationAdd
+          api, repo = HfApi(), os.environ["HF_REPO"]
+          out = os.path.expanduser("~/k3trunk")
+          ops = [CommitOperationAdd(f"trunk/{n}", f"{out}/{n}") for n in sorted(os.listdir(out))
+                 if os.path.isfile(f"{out}/{n}") and not n.endswith(".tmp")]
+          print("publishing", [o.path_in_repo for o in ops])
+          for attempt in range(6):
+              try:
+                  api.create_commit(repo, ops, commit_message="trunk"); break
+              except Exception as e:
+                  print(f"attempt {attempt + 1}: {e!r}"); time.sleep(60 * (attempt + 1))
+          else:
+              raise SystemExit("could not publish trunk/")
+          EOF
