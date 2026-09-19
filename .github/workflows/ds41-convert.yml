@@ -1,0 +1,468 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Convert DeepSeek-V4.1-Flash on free GitHub-hosted runners, in three kinds of
+# job, and publish each piece to a public Hugging Face repo as it lands:
+#
+#   layer  x 40   one MoE layer's experts -> layers/{experts,codebooks}-L<N>.bin
+#   engram x 16   one row range of one Engram table -> engram/*.part
+#   trunk  x 1    everything else -> trunk/ (trunk.bin, manifest, engram.json...)
+#
+# Why this shape (numbers from the release index and the shard headers):
+#   - Every MoE layer's experts live in exactly one ~7.4 GB shard, so a layer
+#     job downloads one file and writes one ~4.8 GB bank. Same recipe as
+#     k3-convert.yml; --codebook-base layer numbers codebooks by position.
+#   - The two Engram tables are 98.3 GB of fp8 each (plus 3.1 GB of scales),
+#     each in a 101.5 GB shard of its own. Downloaded whole, a shard plus the
+#     55.3 GB it converts to does not fit a runner's ~109 GB. Rows are
+#     independent, so each job Range-reads one eighth of a table
+#     (tools/engram_remote.py) and writes one ~6.9 GB part.
+#   - The trunk is 5.2 GB spread over every shard; tools/trunk_remote.py
+#     builds it from Range reads. It hides the Engram tables from itself, or
+#     it would "convert" a sparse shard's zeros.
+#
+# What this does NOT produce: a runnable container. The pieces are ~320 GB
+# together, more than a runner holds. Assemble them where the container will
+# live (docs at the top of tools/ds41_gather.py):
+#
+#   huggingface-cli download <DS41_HF_REPO> --local-dir <dir>/pieces
+#   mv pieces/layers/* pieces/trunk/* pieces/engram/* <dir>/
+#   python3 tools/ds41_gather.py --dir <dir> --scratch <small dir>
+#
+# which concatenates the Engram parts (refusing a gap or overlap), merges the
+# banks into the manifest, and checks every file the engine opens.
+#
+# Resumable: the plan job skips every piece already in the target repo, so a
+# re-run after failures converts only the gaps.
+#
+# Started by pushing to the ds41-convert branch, not by dispatch: a
+# workflow_dispatch workflow must exist on the default branch, and this one
+# has no business on main.
+#
+#   git push origin HEAD:ds41-convert     # start, or resume
+#
+# Needs secrets.HF_TOKEN (write) and vars.DS41_HF_REPO (public model repo).
+
+name: DS41 convert
+
+on:
+  push:
+    branches: [ds41-convert]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ds41-convert
+  cancel-in-progress: false
+
+env:
+  DS41_REPO: deepseek-ai/DeepSeek-V4.1-Flash
+  # Pinned so a piece re-run days later is made by the same code as the rest.
+  TORCH_SPEC: torch==2.14.0
+  HUB_SPEC: huggingface_hub[hf_xet]==1.32.0
+  # Each Engram table is split into this many row ranges, one job apiece.
+  ENGRAM_PARTS: '8'
+  # Empty = every MoE layer. A comma list converts only those.
+  ONLY_LAYERS: ''
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      layers: ${{ steps.plan.outputs.layers }}
+      layer_count: ${{ steps.plan.outputs.layer_count }}
+      parts: ${{ steps.plan.outputs.parts }}
+      part_count: ${{ steps.plan.outputs.part_count }}
+      trunk: ${{ steps.plan.outputs.trunk }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python deps
+        run: python3 -m pip install --quiet --break-system-packages "$HUB_SPEC"
+      - id: plan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.DS41_HF_REPO }}
+        run: |
+          python3 - <<'EOF'
+          import json, math, os, re, struct, sys
+          sys.path.insert(0, "tools")
+          from huggingface_hub import HfApi, hf_hub_download
+          from trunk_remote import http_range
+          assert os.environ.get("HF_TOKEN"), "secrets.HF_TOKEN is not set"
+          repo = os.environ.get("HF_REPO"); assert repo, "vars.DS41_HF_REPO is not set"
+          src = os.environ["DS41_REPO"]
+          api = HfApi()
+          api.create_repo(repo, repo_type="model", private=False, exist_ok=True)
+          have = set(api.list_repo_files(repo))
+
+          idx = json.load(open(hf_hub_download(src, "model.safetensors.index.json")))["weight_map"]
+          cfg = json.load(open(hf_hub_download(src, "config.json")))
+          cfg = cfg.get("text_config") or cfg
+
+          # ---- expert layers: the ones the index says have experts
+          moe = sorted({int(m.group(1)) for n in idx
+                        if (m := re.match(r"layers\.(\d+)\.ffn\.experts\.", n))})
+          want = ([int(x) for x in os.environ["ONLY_LAYERS"].split(",")]
+                  if os.environ["ONLY_LAYERS"] else moe)
+          todo_layers = [L for L in want if not {f"layers/experts-L{L}.bin",
+                                                 f"layers/codebooks-L{L}.bin",
+                                                 f"layers/L{L}.json"} <= have]
+
+          # ---- Engram: row ranges from the real table shapes
+          n = int(os.environ["ENGRAM_PARTS"])
+          parts, engram_total = [], 0
+          for L in cfg["engram_layer_ids"]:
+              name = f"layers.{L}.engram.embed.weight"
+              url = f"https://huggingface.co/{src}/resolve/main/{idx[name]}"
+              (hl,) = struct.unpack("<Q", http_range(url, 0, 8))
+              rows = json.loads(http_range(url, 8, 8 + hl))[name]["shape"][0]
+              step = math.ceil(rows / n)
+              for lo in range(0, rows, step):
+                  hi = min(rows, lo + step)
+                  engram_total += 1
+                  f = f"engram/engram-L{L}.rows-{lo:010d}-{hi:010d}.part"
+                  if f not in have:
+                      parts.append({"layer": L, "lo": lo, "hi": hi})
+
+          trunk = "trunk/trunk.bin" not in have
+          print(f"{len(moe)} MoE layers, converting {todo_layers}")
+          print(f"{engram_total} Engram parts, converting {len(parts)}")
+          print(f"trunk: {'converting' if trunk else 'already published'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"layers={json.dumps(todo_layers)}\nlayer_count={len(todo_layers)}\n"
+                      f"parts={json.dumps(parts)}\npart_count={len(parts)}\n"
+                      f"trunk={'yes' if trunk else 'no'}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"**{len(moe) - len(todo_layers)}/{len(moe)} layers, "
+                      f"{engram_total - len(parts)}/{engram_total} Engram parts already "
+                      f"published; trunk {'to do' if trunk else 'done'}**\n")
+          EOF
+
+  layer:
+    name: L${{ matrix.layer }}
+    needs: plan
+    if: needs.plan.outputs.layer_count != '0'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      # 12 + 6 + the trunk job stays under the 20 concurrent jobs a free
+      # account gets, so none of the three kinds starves another.
+      max-parallel: 12
+      matrix:
+        layer: ${{ fromJSON(needs.plan.outputs.layers) }}
+    env:
+      LAYER: ${{ matrix.layer }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the native encoder
+        run: make libwastevq.so
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
+          python -m pip install --quiet "$HUB_SPEC"
+
+      # Without the .so, convert.py falls back to torch silently: ~15x slower,
+      # which on a 6-hour job limit is the difference between a bank and none.
+      - name: Native encoder is what convert.py will use
+        working-directory: tools
+        run: python -c "import convert; assert convert._load_vq(), 'libwastevq did not load'"
+
+      - name: Fetch config, index and this layer's shard
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          HF_XET_CHUNK_CACHE_SIZE_BYTES: '0'
+        run: |
+          python - <<'EOF'
+          import json, os, re, time
+          from huggingface_hub import hf_hub_download, HfApi
+          repo, L, dst = os.environ["DS41_REPO"], int(os.environ["LAYER"]), os.path.expanduser("~/ds41src")
+          for f in ("config.json", "model.safetensors.index.json"):
+              hf_hub_download(repo, f, local_dir=dst)
+          wm = json.load(open(f"{dst}/model.safetensors.index.json"))["weight_map"]
+          shards = sorted({f for n, f in wm.items()
+                           if re.match(rf"layers\.{L}\.ffn\.experts\.", n)})
+          assert len(shards) == 1, f"layer {L} expert tensors span {shards}"
+          size = {s.path: s.size for s in HfApi().list_repo_tree(repo) if hasattr(s, "size")}
+          t = time.time()
+          p = hf_hub_download(repo, shards[0], local_dir=dst)
+          assert os.path.getsize(p) == size[shards[0]], f"{shards[0]} is short"
+          os.makedirs(os.path.expanduser("~/report"), exist_ok=True)
+          json.dump({"shard": shards[0], "download_s": round(time.time() - t, 1)},
+                    open(os.path.expanduser("~/report/download.json"), "w"))
+          EOF
+          rm -rf "$HOME/ds41src/.cache"
+
+      - name: Convert (exit status is not the verdict)
+        run: |
+          start=$(date +%s)
+          set +e
+          python tools/convert.py --src "$HOME/ds41src" --out "$HOME/ds41out" \
+            --layers "$LAYER" --device cpu --jobs 1 --skip-trunk --codebook-base layer \
+            2>&1 | tee "$HOME/report/convert.log"
+          echo "convert.py status ${PIPESTATUS[0]} (non-zero expected: --skip-trunk with no trunk)"
+          echo "$(( $(date +%s) - start ))" > "$HOME/report/convert_s"
+
+      # The verdict: a whole bank whose codebook slot holds real records. Then
+      # cut that slot out of codebooks.bin — the merge deleted the part, and
+      # the gather step needs it back as codebooks-L{L}.bin beside the bank.
+      - name: Judge the bank and cut out its codebooks
+        working-directory: tools
+        run: |
+          python - <<'EOF'
+          import hashlib, json, os, struct, subprocess, torch, convert
+          L = int(os.environ["LAYER"])
+          out, rep = os.path.expanduser("~/ds41out"), os.path.expanduser("~/report")
+          cfg = json.load(open(os.path.expanduser("~/ds41src/config.json")))
+          cfg = cfg.get("text_config") or cfg
+          n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
+          first = cfg.get("first_k_dense_replace", 0)
+          per = 3 * 3                                    # 3 kinds x --stages 3
+          rec = struct.calcsize("<IHBBII") + convert.CB_ENTRIES * convert.VEC_DIM * 2
+          bank = f"{out}/experts-L{L}.bin"
+          assert convert.bank_is_sound(bank, L, n_exp), f"{bank} is not a whole bank of {n_exp}"
+          base = convert.bank_codebook_base(bank)
+          assert base == (L - first) * per, f"bank base {base}, slot is {(L - first) * per}"
+          raw = open(f"{out}/codebooks.bin", "rb").read()
+          part = raw[base * rec:(base + per) * rec]
+          assert len(part) == per * rec, "codebooks.bin is short of this layer's slot"
+          for i in range(per):
+              magic, cid = struct.unpack_from("<IH", part, i * rec)
+              assert magic == convert.MAGIC_CODEBOOK and cid == (base + i) & 0xFFFF, \
+                  f"record {i} of the slot is not codebook {base + i}"
+          open(f"{out}/codebooks-L{L}.bin", "wb").write(part)
+          h = hashlib.sha256()
+          with open(bank, "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 24), b""):
+                  h.update(chunk)
+          secs = int(open(f"{rep}/convert_s").read())
+          meta = json.load(open(f"{rep}/download.json"))
+          meta.update(layer=L, experts=n_exp, codebook_base=base,
+                      bank_bytes=os.path.getsize(bank), bank_sha256=h.hexdigest(),
+                      codebooks_sha256=hashlib.sha256(part).hexdigest(),
+                      convert_s=secs, s_per_expert=round(secs / n_exp, 3),
+                      warp_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                      torch=torch.__version__, runner=os.uname().machine,
+                      args="--device cpu --jobs 1 --stages 3 --codebook-base layer")
+          json.dump(meta, open(f"{out}/L{L}.json", "w"), indent=1)
+          print(json.dumps(meta, indent=1))
+          EOF
+
+      # One commit per layer carrying all three files, so a layer is either
+      # wholly published or absent — which is what the plan job checks.
+      - name: Publish the layer
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.DS41_HF_REPO }}
+        run: |
+          python - <<'EOF'
+          import os, random, time
+          from huggingface_hub import HfApi, CommitOperationAdd
+          api, repo, L = HfApi(), os.environ["HF_REPO"], os.environ["LAYER"]
+          out = os.path.expanduser("~/ds41out")
+          ops = [CommitOperationAdd(f"layers/{n}", f"{out}/{n}")
+                 for n in (f"experts-L{L}.bin", f"codebooks-L{L}.bin", f"L{L}.json")]
+          for attempt in range(8):
+              try:
+                  t = time.time()
+                  api.create_commit(repo, ops, commit_message=f"layer {L}")
+                  print(f"published layer {L} in {time.time() - t:.0f} s")
+                  break
+              except Exception as e:
+                  wait = min(600, 30 * 2 ** attempt) + random.uniform(0, 30)
+                  print(f"attempt {attempt + 1} failed ({e!r}); retrying in {wait:.0f} s")
+                  time.sleep(wait)
+          else:
+              raise SystemExit(f"layer {L}: could not publish after 8 attempts")
+          EOF
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### L$LAYER"; echo '```json'
+            cat "$HOME/ds41out/L$LAYER.json" 2>/dev/null || tail -20 "$HOME/report/convert.log" 2>/dev/null
+            echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  engram:
+    name: E${{ matrix.part.layer }} ${{ matrix.part.lo }}
+    needs: plan
+    if: needs.plan.outputs.part_count != '0'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.parts) }}
+    env:
+      E_LAYER: ${{ matrix.part.layer }}
+      E_LO: ${{ matrix.part.lo }}
+      E_HI: ${{ matrix.part.hi }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
+          python -m pip install --quiet "$HUB_SPEC"
+
+      # No download: engram_remote.py Range-reads only this job's rows into a
+      # sparse copy of the shard. Exit status is not the verdict.
+      - name: Convert this row range
+        run: |
+          set +e
+          python tools/engram_remote.py --repo "$DS41_REPO" \
+            --src "$HOME/ds41src" --out "$HOME/ds41out" \
+            --layer "$E_LAYER" --rows "$E_LO:$E_HI" 2>&1 | tee "$HOME/convert.log"
+          echo "engram_remote.py status ${PIPESTATUS[0]}"
+
+      - name: Judge the part
+        run: |
+          python - <<'EOF'
+          import os
+          L, lo, hi = (int(os.environ[k]) for k in ("E_LAYER", "E_LO", "E_HI"))
+          p = os.path.expanduser(f"~/ds41out/engram-L{L}.rows-{lo:010d}-{hi:010d}.part")
+          want = (hi - lo) * 144          # 256 dims x 4 bits + 8 fp16 scales
+          assert os.path.exists(p), f"{p} was not written"
+          assert os.path.getsize(p) == want, f"{p} is {os.path.getsize(p)} bytes, not {want}"
+          # A sparse shard reads as zeros. A part of nothing but zero would be
+          # the failure this workflow is built to avoid, so look at the bytes.
+          with open(p, "rb") as f:
+              seen = set()
+              for off in range(0, want, max(1, want // 64)):
+                  f.seek(off); seen.add(f.read(144))
+          assert len(seen) > 8, "the part looks constant: it was not read from the source"
+          print(f"{p}: {want} bytes, {len(seen)} distinct sampled rows")
+          EOF
+
+      - name: Publish the part
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.DS41_HF_REPO }}
+        run: |
+          python - <<'EOF'
+          import os, random, time
+          from huggingface_hub import HfApi, CommitOperationAdd
+          L, lo, hi = (int(os.environ[k]) for k in ("E_LAYER", "E_LO", "E_HI"))
+          name = f"engram-L{L}.rows-{lo:010d}-{hi:010d}.part"
+          api, repo = HfApi(), os.environ["HF_REPO"]
+          ops = [CommitOperationAdd(f"engram/{name}", os.path.expanduser(f"~/ds41out/{name}"))]
+          for attempt in range(8):
+              try:
+                  t = time.time()
+                  api.create_commit(repo, ops, commit_message=f"engram L{L} rows {lo}:{hi}")
+                  print(f"published {name} in {time.time() - t:.0f} s")
+                  break
+              except Exception as e:
+                  wait = min(600, 30 * 2 ** attempt) + random.uniform(0, 30)
+                  print(f"attempt {attempt + 1} failed ({e!r}); retrying in {wait:.0f} s")
+                  time.sleep(wait)
+          else:
+              raise SystemExit(f"{name}: could not publish after 8 attempts")
+          EOF
+
+  trunk:
+    name: trunk
+    needs: plan
+    if: needs.plan.outputs.trunk == 'yes'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python deps
+        run: |
+          python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
+          python -m pip install --quiet "$HUB_SPEC"
+
+      - name: Build the trunk from Range reads
+        run: |
+          /usr/bin/time -v -o "$HOME/time.txt" \
+            python tools/trunk_remote.py --repo "$DS41_REPO" \
+              --src "$HOME/ds41src" --out "$HOME/ds41trunk" 2>&1 | tee "$HOME/trunk.log"
+          status=${PIPESTATUS[0]}
+          grep -E "Maximum resident|Elapsed" "$HOME/time.txt"
+          ls -la "$HOME/ds41trunk"
+          exit $status
+
+      # engram.json and the token map come from the tokenizer, and prove
+      # themselves: ds41_engram.build aborts unless the compressed vocabulary
+      # is the release's 99092 ids. Absent means the #71 failure is back.
+      - name: The Engram index is there
+        run: |
+          test -s "$HOME/ds41trunk/engram.json" && test -s "$HOME/ds41trunk/engram-tokmap.bin" \
+            || { echo "trunk has no Engram index (warp#71)"; exit 1; }
+
+      - name: Publish trunk/
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.DS41_HF_REPO }}
+        run: |
+          python - <<'EOF'
+          import os, time
+          from huggingface_hub import HfApi, CommitOperationAdd
+          api, repo = HfApi(), os.environ["HF_REPO"]
+          out = os.path.expanduser("~/ds41trunk")
+          ops = [CommitOperationAdd(f"trunk/{n}", f"{out}/{n}") for n in sorted(os.listdir(out))
+                 if os.path.isfile(f"{out}/{n}") and not n.endswith(".tmp")]
+          print("publishing", [o.path_in_repo for o in ops])
+          for attempt in range(6):
+              try:
+                  api.create_commit(repo, ops, commit_message="trunk"); break
+              except Exception as e:
+                  print(f"attempt {attempt + 1}: {e!r}"); time.sleep(60 * (attempt + 1))
+          else:
+              raise SystemExit("could not publish trunk/")
+          EOF
+
+  tally:
+    name: tally
+    needs: [plan, layer, engram, trunk]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python deps
+        run: python3 -m pip install --quiet --break-system-packages "$HUB_SPEC"
+      - name: What is published, what is missing
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.DS41_HF_REPO }}
+          PARTS: ${{ needs.plan.outputs.parts }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re
+          from huggingface_hub import HfApi, hf_hub_download
+          api, repo, src = HfApi(), os.environ["HF_REPO"], os.environ["DS41_REPO"]
+          have = set(api.list_repo_files(repo))
+          idx = json.load(open(hf_hub_download(src, "model.safetensors.index.json")))["weight_map"]
+          moe = sorted({int(m.group(1)) for n in idx
+                        if (m := re.match(r"layers\.(\d+)\.ffn\.experts\.", n))})
+          miss_layers = [L for L in moe if f"layers/L{L}.json" not in have]
+          n_parts = len([f for f in have if f.startswith("engram/") and f.endswith(".part")])
+          trunk = "trunk/trunk.bin" in have
+          line = (f"**{len(moe) - len(miss_layers)}/{len(moe)} layers, {n_parts} Engram parts, "
+                  f"trunk {'published' if trunk else 'MISSING'}.** "
+                  + (f"Missing layers: {miss_layers}. " if miss_layers else "")
+                  + "Push to ds41-convert again to convert only the gaps."
+                  if miss_layers or not trunk else
+                  f"Every layer and the trunk are published, with {n_parts} Engram parts; "
+                  f"next is tools/ds41_gather.py, which checks the parts tile both tables.")
+          print(line)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(line + "\n")
+          EOF
