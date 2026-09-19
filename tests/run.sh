@@ -2240,6 +2240,22 @@ else
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 
+# DeepSeek-V4.1's two Engram tables are 98 GB apiece as published. A run that
+# converts one row range must write exactly the bytes that range has in the
+# whole table, or a table gathered from many machines is wrong and nothing
+# says so. Needs real torch, so it skips where the other convert tests stub it.
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py --engram-rows" "$PY_MISS"
+elif out=$(python3 tests/test_engram_rows.py 2>&1); then
+    case "$out" in
+        SKIP*) sk "convert.py --engram-rows" "no torch" ;;
+        *)     ok "convert.py --engram-rows: a slice is the same bytes as the whole table's rows" ;;
+    esac
+else
+    no "convert.py --engram-rows"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
 # And the container it produces has to open. A synthetic one at test scale
 # reaches the parts no other container does: CSA2's shapes, the two-level
 # indexer, the Engram tables and their hashing, a second routing bias. The

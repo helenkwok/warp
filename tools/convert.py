@@ -787,9 +787,23 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes,
     return blocks
 
 
+def engram_part_name(layer, lo, hi):
+    """Where rows [lo, hi) of one Engram table go when a run writes only
+    those. Zero-padded so a plain lexical sort is a row sort, which is what
+    a gather does; and not `.tmp`, which the publishers skip."""
+    return f"engram-L{layer}.rows-{lo:010d}-{hi:010d}.part"
+
+
 def write_engram(st, out_dir, src_name, layer, group=32, bits=4,
-                 chunk_rows=1 << 20):
+                 chunk_rows=1 << 20, rows_range=None):
     """Stream one Engram hash table into engram-L{layer}.bin.
+
+    `rows_range=(lo, hi)` writes only those rows, into engram_part_name(),
+    for a run that owns one slice of the table. Quantization is per row and
+    per group of 32 within it, so a slice is byte-identical to the same rows
+    of a whole-table write, and the parts concatenated in row order are the
+    whole file (tests/test_engram_rows.py). Nothing but the file name and
+    the returned entry differs.
 
     Not a trunk tensor and not an expert bank, because it is neither. 384 M
     rows of 256 values is 98 GB as published and cannot be held; and one
@@ -807,13 +821,20 @@ def write_engram(st, out_dir, src_name, layer, group=32, bits=4,
         raise ValueError(f"{src_name}: dim {dim} is not a multiple of {group}")
     ng = dim // group
     row_bytes = dim * bits // 8 + ng * 2
-    path = os.path.join(out_dir, f"engram-L{layer}.bin")
+    total = rows
+    lo, hi = rows_range if rows_range else (0, total)
+    if not 0 <= lo < hi <= total:
+        raise ValueError(f"{src_name}: rows [{lo}, {hi}) are not inside "
+                         f"the table's {total}")
+    rows = hi - lo
+    path = os.path.join(out_dir, engram_part_name(layer, lo, hi)
+                        if rows_range else f"engram-L{layer}.bin")
     tmp = path + ".tmp"
     scale_name = st.companion(src_name)
     t0, done = time.time(), 0
     with open(tmp, "wb") as f:
-        for r0 in range(0, rows, chunk_rows):
-            r1 = min(rows, r0 + chunk_rows)
+        for r0 in range(lo, hi, chunk_rows):
+            r1 = min(hi, r0 + chunk_rows)
             w = st.row_slice(src_name, r0, r1).float()
             if scale_name is not None:
                 sc = st.row_slice(scale_name, r0, r1)
@@ -841,8 +862,11 @@ def write_engram(st, out_dir, src_name, layer, group=32, bits=4,
     os.replace(tmp, path)
     print(f"  engram L{layer}: {rows} rows x {row_bytes} B = "
           f"{human(os.path.getsize(path))}" + " " * 24)
-    return {"rows": rows, "dim": dim, "group": group, "bits": bits,
-            "row_bytes": row_bytes, "bytes": os.path.getsize(path)}
+    entry = {"rows": rows, "dim": dim, "group": group, "bits": bits,
+             "row_bytes": row_bytes, "bytes": os.path.getsize(path)}
+    if rows_range:
+        entry.update({"row_lo": lo, "row_hi": hi, "table_rows": total})
+    return entry
 
 
 def bank_is_sound(path, layer, n_exp):
@@ -1297,6 +1321,32 @@ def build_engram(st, out_dir, cfg, bits):
     return out
 
 
+def engram_part(st, cfg, out_dir, layer, lo, hi, bits):
+    """--engram-rows: write rows [lo, hi) of one Engram table and nothing
+    else. Resumable by size, like a whole table. Returns a process status.
+    """
+    if layer not in (cfg.get("engram_layer_ids") or []):
+        print(f"--engram-layer {layer}: this checkpoint's Engram layers are "
+              f"{cfg.get('engram_layer_ids') or 'none'}", file=sys.stderr)
+        return 1
+    src = f"layers.{layer}.engram.embed.weight"
+    if not st.have(src):
+        print(f"{src}: its shard is not on disk", file=sys.stderr)
+        return 1
+    rows, dim = st.shape(src)
+    if not 0 <= lo < hi <= rows:
+        print(f"--engram-rows {lo}:{hi} is not inside the table's {rows} rows",
+              file=sys.stderr)
+        return 1
+    row_bytes = dim * bits // 8 + (dim // 32) * 2
+    path = os.path.join(out_dir, engram_part_name(layer, lo, hi))
+    if os.path.exists(path) and os.path.getsize(path) == (hi - lo) * row_bytes:
+        print(f"  engram L{layer} rows {lo}:{hi}: already written, keeping it")
+        return 0
+    write_engram(st, out_dir, src, layer, bits=bits, rows_range=(lo, hi))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True,
@@ -1355,7 +1405,28 @@ def main():
                          "so separate --layers runs on separate machines "
                          "never collide and their banks can be gathered "
                          "into one container afterwards")
+    ap.add_argument("--engram-layer", type=int, default=None,
+                    help="with --engram-rows: which Engram layer's table")
+    ap.add_argument("--engram-rows", default="", metavar="LO:HI",
+                    help="write only rows [LO, HI) of one Engram table to "
+                         "engram-L<N>.rows-<LO>-<HI>.part and exit: no "
+                         "experts, no trunk. Rows are "
+                         "independent, so separate machines can each take a "
+                         "slice of a table too big for one disk; the parts "
+                         "concatenated in row order are engram-L<N>.bin")
     args = ap.parse_args()
+    if args.engram_rows:
+        try:
+            _lo, _hi = (int(x) for x in args.engram_rows.split(":"))
+        except ValueError:
+            ap.error("--engram-rows wants LO:HI, two integers")
+        if args.engram_layer is None:
+            ap.error("--engram-rows needs --engram-layer")
+        if not 0 <= _lo < _hi:
+            ap.error("--engram-rows wants 0 <= LO < HI")
+        args.engram_rows = (_lo, _hi)
+    elif args.engram_layer is not None:
+        ap.error("--engram-layer is only meaningful with --engram-rows")
     if args.jobs < 1:
         ap.error("--jobs must be at least 1")
     if args.cb_sample < 1:
@@ -1386,6 +1457,9 @@ def main():
     cfg = json.load(open(os.path.join(args.src, "config.json")))
     prefix, src_pfx, cfg = source_prefixes(cfg)
     st = ST(args.src)
+    if args.engram_rows:
+        return engram_part(st, cfg, args.out, args.engram_layer,
+                           *args.engram_rows, args.engram_bits)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
 
