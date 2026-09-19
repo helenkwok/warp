@@ -64,6 +64,10 @@ env:
   ENGRAM_PARTS: '8'
   # Empty = every MoE layer. A comma list converts only those.
   ONLY_LAYERS: ''
+  # Empty = every Engram part. A number converts only the first N still to do.
+  MAX_ENGRAM_PARTS: ''
+  # 'no' skips the trunk job.
+  BUILD_TRUNK: 'yes'
 
 jobs:
   plan:
@@ -125,7 +129,9 @@ jobs:
                   if f not in have:
                       parts.append({"layer": L, "lo": lo, "hi": hi})
 
-          trunk = "trunk/trunk.bin" not in have
+          if os.environ["MAX_ENGRAM_PARTS"]:
+              parts = parts[:int(os.environ["MAX_ENGRAM_PARTS"])]
+          trunk = "trunk/trunk.bin" not in have and os.environ["BUILD_TRUNK"] == "yes"
           print(f"{len(moe)} MoE layers, converting {todo_layers}")
           print(f"{engram_total} Engram parts, converting {len(parts)}")
           print(f"trunk: {'converting' if trunk else 'already published'}")
