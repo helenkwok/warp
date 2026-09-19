@@ -63,11 +63,11 @@ env:
   # Each Engram table is split into this many row ranges, one job apiece.
   ENGRAM_PARTS: '8'
   # Empty = every MoE layer. A comma list converts only those.
-  ONLY_LAYERS: ''
+  ONLY_LAYERS: '6'
   # Empty = every Engram part. A number converts only the first N still to do.
-  MAX_ENGRAM_PARTS: ''
+  MAX_ENGRAM_PARTS: '1'
   # 'no' skips the trunk job.
-  BUILD_TRUNK: 'yes'
+  BUILD_TRUNK: 'no'
 
 jobs:
   plan:
