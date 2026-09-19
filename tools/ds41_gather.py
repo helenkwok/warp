@@ -25,6 +25,9 @@ correctly sized engram-L<N>.bin without reading it, but it would write one
 from a sparse shard's zeros if the file were missing. An empty
 .download-state makes every shard read as not-downloaded, so it cannot.
 
+Needs `pip install torch tokenizers numpy` (torch for convert.py, tokenizers
+and numpy for the Engram index, which convert.py rebuilds at the end).
+
   python3 tools/ds41_gather.py --dir /data/ds41.waste \\
       --repo deepseek-ai/DeepSeek-V4.1-Flash --scratch /data/ds41small
 """

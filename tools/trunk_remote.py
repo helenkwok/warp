@@ -63,6 +63,38 @@ def punch_hole(path, off, length):
     return True
 
 
+def trunk_verdict(wm, got, fetched, subset, drop=None):
+    """(ok, message). Is the trunk the index says it should be?
+
+    build_trunk skips a tensor whose shard is absent without a word, so a
+    count is the only thing that tells a whole trunk from a short one.
+    Counting what was fetched would only prove the run agrees with itself,
+    so a full run is held to the index: every name build_trunk's own filters
+    keep. A subset run (--only/--match) can only be held to what it read.
+
+    Two things the first DeepSeek-V4.1 run taught it. `drop` is convert.py's
+    own filter (the DSpark head, `mtp.*`: 72 names): a trunk without them is
+    right, and counting them made every DS41 trunk look 72 tensors short. And
+    fetches are not tensors — a fp8 weight is fetched with its `.scale`, so
+    fetched >= got, and equality only ever held for K3's bf16 trunk.
+    """
+    def is_trunk(name):
+        if ".experts." in name or name.endswith(
+                (".weight_packed", ".weight_scale", ".weight_scale_inv")):
+            return False
+        if name.endswith(".scale") and name[: -len(".scale")] + ".weight" in wm:
+            return False
+        if name.endswith(".engram.embed.weight"):
+            return False
+        return not (drop and drop(name))
+
+    want = fetched if subset else sum(1 for n in wm if is_trunk(n))
+    if got != want or fetched < got or got == 0:
+        return False, (f"trunk has {got} tensors; the index names {want} and "
+                       f"{fetched} were fetched")
+    return True, f"trunk: {got} tensors"
+
+
 def http_range(url, a, b, tries=6):
     """Bytes [a, b) of url. A short read is retried, never returned: a
     truncated tensor is exactly the silent failure this tool must not have."""
@@ -180,28 +212,16 @@ def main():
     print(f"convert.py returned {rc}; fetched {fetched['n']} tensors, "
           f"{fetched['bytes'] / 1e9:.2f} GB", flush=True)
 
-    # ---- the verdict: every trunk tensor the checkpoint has is in the trunk --
-    # build_trunk skips a tensor whose shard is absent without a word, so a
-    # count is the only thing that tells a whole trunk from a short one.
-    # Counting what was fetched would only prove the run agrees with itself,
-    # so the full run is held to the index: every name build_trunk's own
-    # filters keep. A subset run (--only/--match) can only be held to what
-    # it read.
-    def is_trunk(name):
-        if ".experts." in name or name.endswith(
-                (".weight_packed", ".weight_scale", ".weight_scale_inv")):
-            return False
-        if name.endswith(".scale") and name[: -len(".scale")] + ".weight" in wm:
-            return False
-        return not name.endswith(".engram.embed.weight")
-
+    # ---- the verdict: see trunk_verdict ----------------------------------
     m = json.load(open(os.path.join(args.out, "manifest.json")))
+    cfg = json.load(open(os.path.join(args.src, "config.json")))
+    _, _, cfg = convert.source_prefixes(cfg)
+    drop = (convert.ds41_drop_trunk(cfg["num_hidden_layers"])
+            if convert.is_ds41(cfg) else None)
     got = len(m.get("trunk") or [])
-    subset = bool(args.only or args.match)
-    want = fetched["n"] if subset else sum(1 for n in wm if is_trunk(n))
-    if got != want or fetched["n"] != got or got == 0:
-        print(f"trunk has {got} tensors; the index names {want} and "
-              f"{fetched['n']} were fetched", file=sys.stderr)
+    ok, msg = trunk_verdict(wm, got, fetched["n"], bool(args.only or args.match), drop)
+    if not ok:
+        print(msg, file=sys.stderr)
         return 1
     print(f"trunk: {got} tensors, {os.path.getsize(os.path.join(args.out, 'trunk.bin')) / 1e9:.2f} GB")
     return 0

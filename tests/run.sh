@@ -2263,7 +2263,7 @@ fi
 if [ -n "$PY_MISS" ]; then
     sk "engram_remote.py / ds41_gather.py" "$PY_MISS"
 else
-    for t in test_engram_remote test_ds41_gather; do
+    for t in test_engram_remote test_ds41_gather test_trunk_verdict; do
         out=$(python3 tests/$t.py 2>&1); rc=$?
         case "$out" in
             SKIP*) sk "$t" "no torch" ;;

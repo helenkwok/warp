@@ -404,10 +404,18 @@ jobs:
         with:
           python-version: '3.12'
 
+      # tokenizers and numpy are for the Engram index (ds41_engram.build),
+      # which runs at the END of the trunk pass — the first attempt built the
+      # whole trunk in 17 minutes and then died on ModuleNotFoundError. The
+      # import check below is here so that cannot cost 17 minutes again.
+      # 0.22.2 is the version that reproduced the release's 99092 ids.
       - name: Python deps
         run: |
           python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu "$TORCH_SPEC"
-          python -m pip install --quiet "$HUB_SPEC"
+          python -m pip install --quiet "$HUB_SPEC" tokenizers==0.22.2 numpy
+
+      - name: The Engram index can be built
+        run: python -c "import tokenizers, numpy; print('tokenizers', tokenizers.__version__, 'numpy', numpy.__version__)"
 
       - name: Build the trunk from Range reads
         run: |
