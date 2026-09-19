@@ -2256,6 +2256,23 @@ else
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 
+# The Engram tables are converted from Range reads on machines that never see
+# the shard, then put back together. Two things must not go wrong there: a
+# part that differs from a local conversion of the same rows, and a table
+# gathered with a gap or an overlap in it. Both fail silently downstream.
+if [ -n "$PY_MISS" ]; then
+    sk "engram_remote.py / ds41_gather.py" "$PY_MISS"
+else
+    for t in test_engram_remote test_ds41_gather; do
+        out=$(python3 tests/$t.py 2>&1); rc=$?
+        case "$out" in
+            SKIP*) sk "$t" "no torch" ;;
+            *) if [ $rc -eq 0 ]; then ok "$t"
+               else no "$t"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5; fi ;;
+        esac
+    done
+fi
+
 # And the container it produces has to open. A synthetic one at test scale
 # reaches the parts no other container does: CSA2's shapes, the two-level
 # indexer, the Engram tables and their hashing, a second routing bias. The

@@ -47,6 +47,22 @@ sys.path.insert(0, HERE)
 FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE = 0x01, 0x02
 
 
+def punch_hole(path, off, length):
+    """Give a fetched range's blocks back, keeping the file's size. Linux
+    only (fallocate(2)); elsewhere a no-op that keeps the bytes on disk."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if not (hasattr(libc, "fallocate") and sys.platform.startswith("linux")):
+        return False
+    fd = os.open(path, os.O_RDWR)
+    try:
+        if libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                          ctypes.c_long(off), ctypes.c_long(length)):
+            raise OSError(ctypes.get_errno(), "fallocate punch hole")
+    finally:
+        os.close(fd)
+    return True
+
+
 def http_range(url, a, b, tries=6):
     """Bytes [a, b) of url. A short read is retried, never returned: a
     truncated tensor is exactly the silent failure this tool must not have."""
@@ -112,8 +128,6 @@ def main():
     import mxfp4
     import convert
 
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    can_punch = hasattr(libc, "fallocate") and sys.platform.startswith("linux")
     fetched = {"n": 0, "bytes": 0}
     only = {"left": args.only or None}
     orig_have, orig_raw = mxfp4.ST.have, mxfp4.ST.raw
@@ -123,6 +137,12 @@ def main():
         # here, every MoE layer reads as absent — so this run neither fetches
         # nor converts them, and publishes a manifest with the trunk alone.
         if ".experts." in name:
+            return False
+        # DeepSeek-V4.1's Engram tables are 98 GB each and are converted by
+        # tools/engram_remote.py, one row range per machine. Left visible,
+        # build_engram would write them from this run's sparse shards — which
+        # read as zeros — and publish a table of nothing. K3 has none.
+        if ".engram.embed." in name:
             return False
         if only["left"] is not None and only["left"] <= 0:
             return False
@@ -141,14 +161,7 @@ def main():
             f.write(data)
         del data
         t = orig_raw(self, name)                    # copies the bytes out
-        if can_punch:
-            fd = os.open(path, os.O_RDWR)
-            try:
-                if libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                                  ctypes.c_long(b0 + beg), ctypes.c_long(end - beg)):
-                    raise OSError(ctypes.get_errno(), "fallocate punch hole")
-            finally:
-                os.close(fd)
+        punch_hole(path, b0 + beg, end - beg)
         fetched["n"] += 1
         fetched["bytes"] += end - beg
         if only["left"] is not None:
